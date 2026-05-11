@@ -9,9 +9,15 @@ app.use(cors());
 app.use(express.json());
 
 // --- CONFIGURACIÓN DE AWS ---
-const client = new DynamoDBClient({ region: "us-east-1" }); 
+const client = new DynamoDBClient({ 
+    region: process.env.AWS_REGION || "us-east-1",
+    credentials: {
+        accessKeyId: (process.env.AWS_ACCESS_KEY_ID || "").trim(),
+        secretAccessKey: (process.env.AWS_SECRET_ACCESS_KEY || "").trim(),
+        sessionToken: (process.env.AWS_SESSION_TOKEN || "").trim()
+    }
+}); 
 const dynamo = DynamoDBDocumentClient.from(client);
-
 const TABLE_NAME = "Usuarios";
 
 // 1. RUTA DE REGISTRO
