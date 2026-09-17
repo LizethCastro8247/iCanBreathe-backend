@@ -10,9 +10,7 @@ const Lectura = require('./models/Lectura');
 
 const app = express();
 
-// ==========================================
 // CORS
-// ==========================================
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000')
   .split(',')
   .map((o) => o.trim());
@@ -32,9 +30,7 @@ app.use(
 
 app.use(express.json());
 
-// ==========================================
 // CONEXIÓN A MONGODB ATLAS
-// ==========================================
 mongoose
   .connect(process.env.MONGODB_URI)
   .then(() => console.log('✅ Conectado a MongoDB Atlas'))
@@ -169,20 +165,44 @@ app.post('/api/perfil', async (req, res) => {
 // ==========================================
 app.post('/api/lecturas', async (req, res) => {
   try {
-    if (!req.body || !req.body.device_id) {
+    const cuerpo = req.body || {};
+
+    // Modo lote: el ESP32 manda las 8 lecturas juntas en un solo POST,
+    // como { lecturas: [ {...}, {...}, ... ] }. Esto evita hacer 8
+    // conexiones HTTPS separadas (8 handshakes TLS) por cada ciclo.
+    if (Array.isArray(cuerpo.lecturas)) {
+      if (cuerpo.lecturas.length === 0) {
+        return res.status(400).json({ mensaje: 'El arreglo "lecturas" viene vacío' });
+      }
+
+      const ahora = Date.now() / 1000;
+      const documentos = cuerpo.lecturas
+        .filter((l) => l && l.device_id)
+        .map((l) => ({ ...l, tiempo: l.tiempo || ahora }));
+
+      if (documentos.length === 0) {
+        return res.status(400).json({ mensaje: 'Ninguna lectura trae device_id' });
+      }
+
+      await Lectura.insertMany(documentos);
+      return res.status(201).json({ mensaje: `${documentos.length} lecturas guardadas` });
+    }
+
+    // Modo individual (se mantiene por compatibilidad): una sola lectura
+    if (!cuerpo.device_id) {
       return res.status(400).json({ mensaje: 'device_id requerido' });
     }
 
     const lectura = new Lectura({
-      ...req.body,
-      tiempo: req.body.tiempo || Date.now() / 1000
+      ...cuerpo,
+      tiempo: cuerpo.tiempo || Date.now() / 1000
     });
 
     await lectura.save();
     res.status(201).json({ mensaje: 'Lectura guardada' });
   } catch (error) {
-    console.error('Error guardando lectura:', error);
-    res.status(500).json({ mensaje: 'Error al guardar lectura', detalle: error.message });
+    console.error('Error guardando lectura(s):', error);
+    res.status(500).json({ mensaje: 'Error al guardar lectura(s)', detalle: error.message });
   }
 });
 
