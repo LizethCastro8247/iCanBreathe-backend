@@ -1,56 +1,26 @@
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs'); // Para cifrar contraseñas
-const mongoose = require('mongoose');
+const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+const { DynamoDBDocumentClient, PutCommand, GetCommand, ScanCommand } = require("@aws-sdk/lib-dynamodb");
 
 const app = express();
-
-// --- CONFIGURACIÓN DE CORS ---
-// Permite peticiones desde Vercel o local
-app.use(cors({
-    origin: process.env.FRONTEND_URL || '*'
-}));
+app.use(cors());
 app.use(express.json());
 
-// --- CONEXIÓN A MONGO DB ATLAS ---
-const MONGO_URI = process.env.MONGO_URI;
+// --- CONFIGURACIÓN DE AWS ---
+const client = new DynamoDBClient({ 
+    region: process.env.AWS_REGION || "us-east-1",
+    credentials: {
+        accessKeyId: (process.env.AWS_ACCESS_KEY_ID || "").trim(),
+        secretAccessKey: (process.env.AWS_SECRET_ACCESS_KEY || "").trim(),
+        sessionToken: (process.env.AWS_SESSION_TOKEN || "").trim()
+    }
+}); 
+const dynamo = DynamoDBDocumentClient.from(client);
+const TABLE_NAME = "Usuarios";
 
-if (!MONGO_URI) {
-    console.error("Error: La variable de entorno MONGO_URI no está configurada.");
-}
-
-mongoose.connect(MONGO_URI)
-    .then(() => console.log('Conectado con éxito a MongoDB Atlas'))
-    .catch(err => console.error('Error al conectar a MongoDB:', err));
-
-// --- MODELOS Y ESQUEMAS DE MONGOOSE ---
-
-// Esquema para la colección "Usuarios"
-const usuarioSchema = new mongoose.Schema({
-    correo: { type: String, required: true, unique: true },
-    contraseña: { type: String, required: true },
-    nombres: String,
-    apellidos: String,
-    fechaNacimiento: String,
-    edad: SchemaTypes = Number,
-    telefono: String,
-    fechaRegistro: { type: String, default: () => new Date().toISOString() },
-    estacion_asignada: { type: String, default: "Estacion_iCanBreath_01" }
-}, { strict: false }); // strict: false permite campos flexibles si actualizas el perfil con nuevos datos
-
-const Usuario = mongoose.model('Usuario', usuarioSchema, 'Usuarios');
-
-// Esquema para la colección "Sensores"
-const sensorSchema = new mongoose.Schema({
-    tiempo: Number
-}, { strict: false }); // Permite recibir cualquier tipo de lectura/medición de sensores
-
-const Sensor = mongoose.model('Sensor', sensorSchema, 'Sensores');
-
-
-// ==========================================
 // 1. RUTA DE REGISTRO
-// ==========================================
 app.post('/api/registro', async (req, res) => {
     const { nombres, apellidos, fechaNacimiento, edad, telefono, correo, contraseña } = req.body;
 
@@ -61,9 +31,13 @@ app.post('/api/registro', async (req, res) => {
 
     try {
         // --- VERIFICACIÓN 2: ¿El usuario ya existe? ---
-        const existing = await Usuario.findOne({ correo: correo });
+        const checkUser = new GetCommand({
+            TableName: TABLE_NAME,
+            Key: { correo: correo }
+        });
+        const existing = await dynamo.send(checkUser);
         
-        if (existing) {
+        if (existing.Item) {
             return res.status(400).json({ mensaje: "El correo ya está registrado" });
         }
 
@@ -71,8 +45,8 @@ app.post('/api/registro', async (req, res) => {
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(contraseña, salt);
 
-        // Crear el objeto del usuario
-        const nuevoUsuario = new Usuario({
+        // Preparar el objeto del usuario
+        const nuevoUsuario = {
             correo,
             contraseña: hashedPassword,
             nombres,
@@ -82,22 +56,23 @@ app.post('/api/registro', async (req, res) => {
             telefono,
             fechaRegistro: new Date().toISOString(),
             estacion_asignada: "Estacion_iCanBreath_01" 
-        });
+        };
 
-        // Guardar en MongoDB
-        await nuevoUsuario.save();
+        // Guardar en DynamoDB
+        await dynamo.send(new PutCommand({
+            TableName: TABLE_NAME,
+            Item: nuevoUsuario
+        }));
 
         res.status(201).json({ mensaje: "Usuario creado exitosamente" });
 
     } catch (error) {
-        console.error("Error en registro:", error);
+        console.error(error);
         res.status(500).json({ mensaje: "Error al registrar en la base de datos" });
     }
 });
 
-// ==========================================
 // 2. RUTA DE LOGIN
-// ==========================================
 app.post('/api/login', async (req, res) => {
     const { correo, contraseña } = req.body;
 
@@ -108,7 +83,13 @@ app.post('/api/login', async (req, res) => {
 
     try {
         // --- VERIFICACIÓN 2: Buscar usuario ---
-        const usuario = await Usuario.findOne({ correo: correo }).lean();
+        const comando = new GetCommand({
+            TableName: TABLE_NAME,
+            Key: { correo: correo }
+        });
+        
+        const respuesta = await dynamo.send(comando);
+        const usuario = respuesta.Item;
 
         if (!usuario) {
             return res.status(400).json({ mensaje: "El usuario no existe" });
@@ -121,14 +102,14 @@ app.post('/api/login', async (req, res) => {
             return res.status(400).json({ mensaje: "Contraseña incorrecta" });
         }
 
-        const { contraseña: _, _id, __v, ...datosPublicos } = usuario;
+        const { contraseña: _, ...datosPublicos } = usuario;
         res.json({ 
             mensaje: "Login exitoso", 
             usuario: datosPublicos 
         });
 
     } catch (error) {
-        console.error("Error en login:", error);
+        console.error(error);
         res.status(500).json({ mensaje: "Error de conexión con el servidor" });
     }
 });
@@ -138,16 +119,18 @@ app.post('/api/login', async (req, res) => {
 // ==========================================
 app.get('/api/perfil/:correo', async (req, res) => {
     try {
-        const usuario = await Usuario.findOne({ correo: req.params.correo }).lean();
+        const comando = new GetCommand({
+            TableName: TABLE_NAME,
+            Key: { correo: req.params.correo }
+        });
+        const respuesta = await dynamo.send(comando);
         
-        if (usuario) {
-            const { contraseña: _, _id, __v, ...datosPerfil } = usuario;
-            res.json(datosPerfil);
+        if (respuesta.Item) {
+            res.json(respuesta.Item);
         } else {
             res.status(404).json({ mensaje: "Perfil no encontrado" });
         }
     } catch (error) {
-        console.error("Error obteniendo perfil:", error);
         res.status(500).json({ mensaje: "Error al obtener perfil" });
     }
 });
@@ -162,23 +145,23 @@ app.post('/api/perfil', async (req, res) => {
     if (!correoUsuario) return res.status(400).json({ mensaje: "Correo requerido" });
 
     try {
-        const existente = await Usuario.findOne({ correo: correoUsuario });
-        if (!existente) return res.status(404).json({ mensaje: "Usuario no encontrado" });
+        // Obtenemos el usuario actual para no sobreescribir datos importantes
+        const existente = await dynamo.send(new GetCommand({ TableName: TABLE_NAME, Key: { correo: correoUsuario } }));
+        if (!existente.Item) return res.status(404).json({ mensaje: "Usuario no encontrado" });
 
-        // Si el usuario cambia la contraseña, la ciframos
-        if (datos.password && datos.password !== existente.contraseña) {
-            const salt = await bcrypt.genSalt(10);
-            datos.contraseña = await bcrypt.hash(datos.password, salt);
-            delete datos.password;
+        let usuarioActualizado = { ...existente.Item, ...datos };
+
+        // Si el usuario cambió la contraseña, la volvemos a cifrar
+        if (datos.password && datos.password !== existente.Item.contraseña) {
+             const salt = await bcrypt.genSalt(10);
+             usuarioActualizado.contraseña = await bcrypt.hash(datos.password, salt);
         }
 
-        // Actualizamos los campos recibidos
-        Object.assign(existente, datos);
-        await existente.save();
-
+        // Guardamos en DynamoDB
+        await dynamo.send(new PutCommand({ TableName: TABLE_NAME, Item: usuarioActualizado }));
         res.json({ mensaje: "Perfil actualizado correctamente" });
     } catch (error) {
-        console.error("Error al actualizar perfil:", error);
+        console.error(error);
         res.status(500).json({ mensaje: "Error al actualizar perfil" });
     }
 });
@@ -188,14 +171,22 @@ app.post('/api/perfil', async (req, res) => {
 // ==========================================
 app.get('/api/lecturas', async (req, res) => {
     try {
-        // Obtenemos los datos ordenados por "tiempo" del más reciente al más antiguo (-1)
-        const lecturas = await Sensor.find().sort({ tiempo: -1 }).lean();
+        // Obtenemos los datos de la tabla de sensores
+        const comando = new ScanCommand({
+            TableName: "Sensores"
+        });
+        const respuesta = await dynamo.send(comando);
+        
+        // Ordenamos los datos por "tiempo" (del más reciente al más antiguo)
+        const datosOrdenados = respuesta.Items.sort((a, b) => b.tiempo - a.tiempo);
 
-        res.json(lecturas);
+        // Enviamos los datos a React
+        res.json(datosOrdenados);
     } catch (error) {
         console.error("Error obteniendo lecturas:", error);
+        // Le agregamos "detalle" para que el servidor nos confiese qué salió mal
         res.status(500).json({ 
-            mensaje: "Error al obtener lecturas de MongoDB", 
+            mensaje: "Error al obtener lecturas de DynamoDB", 
             detalle: error.message,
             tipo_de_error: error.name
         });
